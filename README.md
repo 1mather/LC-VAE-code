@@ -4,12 +4,7 @@
     <img src="https://github.com/user-attachments/assets/fba781e5-497d-44fa-abb5-07b3b3e8a471" width="256"/>
 </p>
 
-<h5 align="center">
 
-[![arXiv](https://img.shields.io/badge/arXiv-paper-b31b1b.svg?logo=arXiv)]()
-[![License](https://img.shields.io/badge/License-Apache%202.0-yellow)](LICENSE)
-
-</h5>
 
 ## Overview
 
@@ -192,11 +187,13 @@ LC-VAE-code/
 
 ## Citation
 
+If you find this work useful, please cite:
 ```bibtex
-@article{lcvae2025,
-  title={LC-VAE: Latent Channel-wise Compression for Video VAE},
-  author={},
-  year={2025}
+@inproceedings{guan2026lcvae,
+  title     = {Latent-Compressed Variational Autoencoder for Video Diffusion Models},
+  author    = {Guan, Jiarui and Zhao, Wenshuai and Zou, Zhengtao and Kannala, Juho and Solin, Arno},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2026},
 }
 ```
 
