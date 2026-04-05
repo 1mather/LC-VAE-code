@@ -1,8 +1,5 @@
 # LC-VAE: Latent Channel-wise Compression for Video VAE
 
-<p align="center">
-    <img src="https://github.com/user-attachments/assets/fba781e5-497d-44fa-abb5-07b3b3e8a471" width="256"/>
-</p>
 
 
 
