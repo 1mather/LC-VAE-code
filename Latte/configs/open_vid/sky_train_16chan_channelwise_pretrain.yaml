@@ -1,0 +1,62 @@
+# dataset
+dataset: "sky"
+
+data_path: "/scratch/cs/vidgen/guanjr/OpenVid-1M/data/video"
+
+# save and load
+results_dir: "/scratch/cs/aaltoml/users/guanjr/experiment/latte/OpenVid-1M_16chan"
+pretrained_model_path: 
+ckpt: "/scratch/cs/aaltoml/users/guanjr/experiment/latte/Webvid_16chan/014-Latte-XL-2-F8S3-sky/checkpoints/0120000.pt"
+# model config: 
+model: Latte-XL/2
+cfg_scale: 7
+data_num_frames: 32
+num_frames: 8
+image_size: 256 # choices=[256, 512]
+num_sampling_steps: 250
+frame_interval: 3
+fixed_spatial: False
+attention_bias: True
+learn_sigma: True
+extras: 2 # [1, 2] 1 unconditional generation, 2 class-conditional generation
+
+# train config:
+save_ceph: True # important
+learning_rate: 1e-4
+ckpt_every: 20000
+clip_max_norm: 0.1
+start_clip_iter: 100000
+local_batch_size: 10 # important
+max_train_steps: 10000000
+global_seed: 3407
+num_workers: 8
+log_every: 100
+val_every: 50000000
+lr_warmup_steps: 0
+resume_from_checkpoint: True
+gradient_accumulation_steps: 1 # TODO
+num_classes: 101
+
+# low VRAM and speed up training
+use_compile: False
+mixed_precision: False
+enable_xformers_memory_efficient_attention: False
+gradient_checkpointing: False
+
+
+latent_size:
+use_fp16: True
+eval_batch_size: 16
+eval_subset_size: 2048
+val_video_path: /scratch/cs/vidgen/guanjr/UCF-101-test-1000
+
+
+vae_latent_scale: 
+vae_latent_std_npz: /scratch/cs/vidgen/guanjr/project/latent_wf_vae_new/latent_channel_stats_compressed.npz
+
+in_channels: 16
+original_in_channels: 1024
+vae_model_name: WVAE_Compressed_TopK_multi_wavelet
+vae_from_pretrained: /scratch/cs/vidgen/guanjr/experiment/WFVAE_Experiment/WVAE_Channel_Keepratio_0.5_no_teacher_loss_32_channels_fix_topk_32frame_8gpu-lr2.00e-05-bs4-rs256-sr1-fr32-cons0.0-p1_1200000-p2_0-modetv_l1-20251105_182758/checkpoint-210000.ckpt
+vae_model_config: /scratch/cs/vidgen/guanjr/project/latent_wf_vae_new/examples/WVAE_compressed_topk_multi_wavelet/wfvae-temporal-compressed-example-fix-topk-handcraft-32chan.json
+fixed_mask_path: /scratch/cs/vidgen/guanjr/project/latent_wf_vae_new/causalvideovae/model/channel_name/3D_t_t/keep_ratio_0.5_32_channel_50%/channel_masks/fixed_mask_from_handcraft.pth

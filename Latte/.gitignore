@@ -1,0 +1,10 @@
+.vscode
+preprocess
+results
+results_img
+sample_videos
+
+
+__pycache__/
+*.py[cod]
+*$py.class

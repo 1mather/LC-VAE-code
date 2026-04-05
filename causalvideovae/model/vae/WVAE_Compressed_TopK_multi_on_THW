@@ -1,0 +1,1191 @@
+from typing import Any, List
+import torch
+import torch.nn as nn
+import os
+from collections import deque
+import math
+from ..modules import (
+    ResnetBlock2D,
+    ResnetBlock3D,
+    Conv2d,
+    HaarWaveletTransform3D,
+    InverseHaarWaveletTransform3D,
+    CausalConv3d,
+    Normalize,
+    nonlinearity,
+)
+from ..registry import ModelRegistry
+from ..modeling_videobase import VideoBaseAE
+from ..utils.module_utils import resolve_str_to_obj
+from ..utils.distrib_utils import DiagonalGaussianDistribution
+from ..modeling_output import AutoencoderKLOutput, DecoderOutput, ForwardOutput
+from diffusers.configuration_utils import register_to_config
+
+
+class Encoder(VideoBaseAE):
+
+    @register_to_config
+    def __init__(
+        self,
+        latent_dim: int = 8,
+        base_channels: int = 128,
+        num_resblocks: int = 2,
+        energy_flow_hidden_size: int = 64,
+        dropout: float = 0.0,
+        attention_type: str = "AttnBlock3DFix",
+        use_attention: bool = True,
+        norm_type: str = "groupnorm",
+        l1_dowmsample_block: str = "Downsample",
+        l1_downsample_wavelet: str = "HaarWaveletTransform2D",
+        l2_dowmsample_block: str = "Spatial2xTime2x3DDownsample",
+        l2_downsample_wavelet: str = "HaarWaveletTransform3D",
+    ) -> None:
+        super().__init__()
+        self.down1 = nn.Sequential(
+            Conv2d(24, base_channels, kernel_size=3, stride=1, padding=1),
+            *[
+                ResnetBlock2D(
+                    in_channels=base_channels,
+                    out_channels=base_channels,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for _ in range(num_resblocks)
+            ],
+            resolve_str_to_obj(l1_dowmsample_block)(
+                in_channels=base_channels, out_channels=base_channels
+            ),
+        )
+        self.down2 = nn.Sequential(
+            Conv2d(
+                base_channels + energy_flow_hidden_size,
+                base_channels * 2,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            *[
+                ResnetBlock3D(
+                    in_channels=base_channels * 2,
+                    out_channels=base_channels * 2,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for _ in range(num_resblocks)
+            ],
+            resolve_str_to_obj(l2_dowmsample_block)(
+                base_channels * 2, base_channels * 2
+            ),
+        )
+        # Connection
+        if l1_dowmsample_block == "Downsample":  # Bad code. For temporal usage.
+            l1_channels = 12
+        else:
+            l1_channels = 24
+
+        self.connect_l1 = Conv2d(
+            l1_channels, energy_flow_hidden_size, kernel_size=3, stride=1, padding=1
+        )
+        self.connect_l2 = Conv2d(
+            24, energy_flow_hidden_size, kernel_size=3, stride=1, padding=1
+        )
+        # Mid
+        mid_layers = [
+            ResnetBlock3D(
+                in_channels=base_channels * 2 + energy_flow_hidden_size,
+                out_channels=base_channels * 4,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+            ResnetBlock3D(
+                in_channels=base_channels * 4,
+                out_channels=base_channels * 4,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+        ]
+        if use_attention:
+            mid_layers.insert(
+                1,
+                resolve_str_to_obj(attention_type)(
+                    in_channels=base_channels * 4, norm_type=norm_type
+                ),
+            )
+        self.mid = nn.Sequential(*mid_layers)
+
+        self.norm_out = Normalize(base_channels * 4, norm_type=norm_type)
+        self.conv_out = CausalConv3d(
+            base_channels * 4, latent_dim * 2, kernel_size=3, stride=1, padding=1
+        )
+
+        self.wavelet_transform_in = HaarWaveletTransform3D()
+        self.wavelet_transform_l1 = resolve_str_to_obj(l1_downsample_wavelet)()
+        self.wavelet_transform_l2 = resolve_str_to_obj(l2_downsample_wavelet)()
+
+    def forward(self, x):
+        coeffs = self.wavelet_transform_in(x)
+
+        l1_coeffs = coeffs[:, :3]
+        l1_coeffs = self.wavelet_transform_l1(l1_coeffs)
+        l1 = self.connect_l1(l1_coeffs)
+        l2_coeffs = self.wavelet_transform_l2(l1_coeffs[:, :3])
+        l2 = self.connect_l2(l2_coeffs)
+
+        h = self.down1(coeffs)
+        h = torch.concat([h, l1], dim=1)
+        h = self.down2(h)
+        h = torch.concat([h, l2], dim=1)
+        h = self.mid(h)
+        h = self.norm_out(h)
+        h = nonlinearity(h)
+        h = self.conv_out(h)
+
+        return h, (l1_coeffs, l2_coeffs)
+
+
+class Decoder(VideoBaseAE):
+
+    @register_to_config
+    def __init__(
+        self,
+        latent_dim: int = 8,
+        base_channels: int = 128,
+        num_resblocks: int = 2,
+        dropout: float = 0.0,
+        energy_flow_hidden_size: int = 128,
+        attention_type: str = "AttnBlock3DFix",
+        use_attention: bool = True,
+        norm_type: str = "groupnorm",
+        t_interpolation: str = "nearest",
+        connect_res_layer_num: int = 1,
+        l1_upsample_block: str = "Upsample",
+        l1_upsample_wavelet: str = "InverseHaarWaveletTransform2D",
+        l2_upsample_block: str = "Spatial2xTime2x3DUpsample",
+        l2_upsample_wavelet: str = "InverseHaarWaveletTransform3D",
+    ) -> None:
+        super().__init__()
+        self.energy_flow_hidden_size = energy_flow_hidden_size
+
+        self.conv_in = CausalConv3d(
+            latent_dim, base_channels * 4, kernel_size=3, stride=1, padding=1
+        )
+        mid_layers = [
+            ResnetBlock3D(
+                in_channels=base_channels * 4,
+                out_channels=base_channels * 4,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+            ResnetBlock3D(
+                in_channels=base_channels * 4,
+                out_channels=base_channels * 4 + energy_flow_hidden_size,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+        ]
+        
+        if use_attention:
+            mid_layers.insert(
+                1,
+                resolve_str_to_obj(attention_type)(
+                    in_channels=base_channels * 4, norm_type=norm_type
+                ),
+            )
+
+        self.mid = nn.Sequential(*mid_layers)
+
+        upsample_depth = 0
+        self.up2 = nn.Sequential(
+            *[
+                ResnetBlock3D(
+                    in_channels=base_channels * 4,
+                    out_channels=base_channels * 4,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for _ in range(num_resblocks)
+            ],
+            resolve_str_to_obj(l2_upsample_block)(
+                base_channels * 4, base_channels * 4, t_interpolation=t_interpolation, depth=upsample_depth
+            ),
+            ResnetBlock3D(
+                in_channels=base_channels * 4,
+                out_channels=base_channels * 4 + energy_flow_hidden_size,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+        )
+        upsample_depth += 1
+        
+        self.up1 = nn.Sequential(
+            *[
+                ResnetBlock3D(
+                    in_channels=base_channels * (4 if i == 0 else 2),
+                    out_channels=base_channels * 2,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for i in range(num_resblocks)
+            ],
+            resolve_str_to_obj(l1_upsample_block)(
+                in_channels=base_channels * 2, out_channels=base_channels * 2, t_interpolation=t_interpolation, depth=upsample_depth
+            ),
+            ResnetBlock3D(
+                in_channels=base_channels * 2,
+                out_channels=base_channels * 2,
+                dropout=dropout,
+                norm_type=norm_type,
+            ),
+        )
+        
+        self.layer = nn.Sequential(
+            *[
+                ResnetBlock3D(
+                    in_channels=base_channels * (2 if i == 0 else 1),
+                    out_channels=base_channels,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for i in range(2)
+            ],
+        )
+        # Connection
+        if l1_upsample_block == "Upsample":  # Bad code. For temporal usage.
+            l1_channels = 12
+        else:
+            l1_channels = 24
+        self.connect_l1 = nn.Sequential(
+            *[
+                ResnetBlock3D(
+                    in_channels=energy_flow_hidden_size,
+                    out_channels=energy_flow_hidden_size,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for _ in range(connect_res_layer_num)
+            ],
+            Conv2d(
+                energy_flow_hidden_size, l1_channels, kernel_size=3, stride=1, padding=1
+            ),
+        )
+        self.connect_l2 = nn.Sequential(
+            *[
+                ResnetBlock3D(
+                    in_channels=energy_flow_hidden_size,
+                    out_channels=energy_flow_hidden_size,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                )
+                for _ in range(connect_res_layer_num)
+            ],
+            Conv2d(energy_flow_hidden_size, 24, kernel_size=3, stride=1, padding=1),
+        )
+        # Out
+        self.norm_out = Normalize(base_channels, norm_type=norm_type)
+        self.conv_out = Conv2d(base_channels, 24, kernel_size=3, stride=1, padding=1)
+
+        self.inverse_wavelet_transform_out = InverseHaarWaveletTransform3D()
+        self.inverse_wavelet_transform_l1 = resolve_str_to_obj(l1_upsample_wavelet)()
+        self.inverse_wavelet_transform_l2 = resolve_str_to_obj(l2_upsample_wavelet)()
+
+    def forward(self, z):
+        h = self.conv_in(z)
+        h = self.mid(h)
+
+        l2_coeffs = self.connect_l2(h[:, -self.energy_flow_hidden_size :])
+        l2 = self.inverse_wavelet_transform_l2(l2_coeffs)
+
+        h = self.up2(h[:, : -self.energy_flow_hidden_size])
+
+        l1_coeffs = h[:, -self.energy_flow_hidden_size :]
+        l1_coeffs = self.connect_l1(l1_coeffs)
+        l1_coeffs[:, :3] = l1_coeffs[:, :3] + l2
+        l1 = self.inverse_wavelet_transform_l1(l1_coeffs)
+
+        h = self.up1(h[:, : -self.energy_flow_hidden_size])
+
+        h = self.layer(h)
+        h = self.norm_out(h)
+        h = nonlinearity(h)
+        h = self.conv_out(h)
+        h[:, :3] = h[:, :3] + l1
+
+        dec = self.inverse_wavelet_transform_out(h)
+        return dec, (l1_coeffs, l2_coeffs)
+
+class TemporalCompressedLatentProcessor(nn.Module):
+    """
+    Top-K时间压缩的Latent处理器（三阶段训练）
+    """
+    def __init__(
+        self, 
+        dwt3d_cls: str = "HaarWaveletTransform3D", 
+        idwt3d_cls: str = "InverseHaarWaveletTransform3D",
+        training_phase: str = "phase1",  # "phase1", "phase2", or "phase3"
+        temporal_consistency_mode: str = "tv_l1",  # "tv_l1", "temporal_variance", etc.
+        keep_ratio: float = 0.5,
+        temperature: float = 0.5,
+        score_mode: str = "l2",
+        hl_boost: float = 1.0,
+        var_boost: float = 0.3,
+        compress_strategy: str = "ungrouped",  # "ungrouped" or "groupwise"
+        exact_k: bool = False,
+        multi_wavelet: bool = False,
+        dwt_temporal_cls: str = "HaarWaveletTemporalTransform",
+        idwt_temporal_cls: str = "InverseHaarWaveletTemporalTransform",
+        global_topk: bool = True,
+        use_fixed_mask: bool = False,  # 是否使用固定mask
+        fixed_mask_path: str = None,   # 固定mask文件路径
+        not_compress: bool = False,
+    ):
+        super().__init__()
+        self.not_compress=not_compress
+
+        DWT3D = resolve_str_to_obj(dwt3d_cls)
+        IDWT3D = resolve_str_to_obj(idwt3d_cls)
+        self.dwt3d = DWT3D()
+        self.idwt3d = IDWT3D()
+        DWTTemporal = resolve_str_to_obj(dwt_temporal_cls)
+        IDWTTemporal = resolve_str_to_obj(idwt_temporal_cls)
+        self.dwt_temporal_cls = dwt_temporal_cls
+        self.idwt_temporal_cls = idwt_temporal_cls
+        self.dwt_temporal = DWTTemporal()
+        self.idwt_temporal = IDWTTemporal()
+
+        self.global_topk = global_topk
+        
+        # 固定mask模式
+        self.use_fixed_mask = use_fixed_mask
+        self.fixed_mask = None
+        if use_fixed_mask and fixed_mask_path:
+            self.load_fixed_mask(fixed_mask_path)
+        
+        # 用于记录通道选择的统计信息
+        self.channel_selection_stats = {
+            'mask_history': [],  # 记录每次的mask
+            'scores_history': [],  # 记录每次的scores
+            'selected_channels_count': None,  # 累计每个通道被选中的次数
+            'total_calls': 0,  # 总调用次数
+        }
+        
+        # 训练阶段
+        self.training_phase = training_phase
+        self.temporal_consistency_mode = temporal_consistency_mode
+        
+        # Top-K 与压缩策略参数
+        self.keep_ratio = keep_ratio
+        self.temperature = temperature
+        self.score_mode = score_mode
+        self.hl_boost = hl_boost
+        self.var_boost = var_boost
+        self.compress_strategy = compress_strategy
+        self.exact_k = exact_k
+        self.multi_wavelet = multi_wavelet
+        # 控制时间小波分解的层数；当前默认做两次（与前向保持对称）
+        self.temporal_wavelet_levels = 2 if self.multi_wavelet else 0
+
+
+    
+    def set_training_phase(self, phase: str):
+        """切换训练阶段"""
+        assert phase in ["phase1", "phase2", "phase3"]
+        self.training_phase = phase
+        try:
+            is_main = os.environ.get("LOCAL_RANK", "0") == "0"
+        except Exception:
+            is_main = True
+        # if is_main:
+        #     print(
+        #         f"\n--------------------------------\n"
+        #         f"[TemporalProcessor]\n"
+        #         f"- phase: {self.training_phase}\n"
+        #         f"- keep_ratio: {self.keep_ratio}\n"
+        #         f"- temperature: {self.temperature}\n"
+        #         f"- score_mode: {self.score_mode}\n"
+        #         f"- strategy: {self.compress_strategy}\n"
+        #         f"- exact_k: {self.exact_k}\n"
+        #         f"- multi_wavelet: {self.multi_wavelet}\n"
+        #         f"--------------------------------",
+        #         flush=True,
+        #     )
+
+    
+    def lowfreq_consistency_loss(self, LL: torch.Tensor, mode: str = "tv_l1") -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算低频一致性损失
+        - "temporal_variance": 直接对时间维 T 求方差并平均成标量
+        - "tv_l1": 时间差分（TV-L1）平滑损失，抑制相邻帧间的跳跃
+        """
+        if LL.ndim != 5:
+            raise ValueError("LL must be (B,C,T,H,W)")
+        
+        # 计算方差（用于监控）
+        def temporal_var_si(L):
+            var_t = L.var(dim=2, unbiased=False)
+            scale = (L**2).mean(dim=2, keepdim=False) + 1e-6
+            return (var_t / scale).sum()
+        
+        ll_variance = temporal_var_si(LL)
+        
+
+        if mode == "tv_l1":
+            B, C, T, H, W = LL.shape
+            if T <= 1:
+                return (LL * 0.0).sum(), ll_variance  # 保持梯度连接的零损失
+            
+            # 时间差分 L1范数
+            dt = LL[:, :, 1:, :, :] - LL[:, :, :-1, :, :]  # (B,C,T-1,H,W)
+            tv = dt.abs()  # L1范数
+            return tv.sum(), ll_variance
+        else:
+            raise ValueError(f"Unknown consistency mode: {mode}")
+
+
+    @staticmethod
+    def hard_topk_mask(scores: torch.Tensor, k: int):
+        """
+        Hard Top-K 掩码：每个样本取前 k 个通道置 1，其余置 0
+        返回: (B, N) 掩码
+        """
+        B, N = scores.shape
+        if k <= 0:
+            return torch.zeros_like(scores)
+        if k >= N:
+            return torch.ones_like(scores)
+        idx = torch.topk(scores, k, dim=1).indices
+        mask = torch.zeros_like(scores)
+        return mask.scatter(1, idx, 1.0)
+
+    @staticmethod
+    def soft_topk_mask(scores: torch.Tensor, k: int, temperature: float = 0.5, exact_k: bool = False):
+        """
+        可微 Top-K 掩码近似（batch 独立）:
+        - scores: (B, N)
+        - k:      int, 0<=k<=N
+        - temperature: 越小越接近硬 top-k；越大越平滑
+        - exact_k: 若为 True，会把掩码归一化使 batch 内和 ≈ k（会让掩码可能>1，必要时可再 clamp）
+        返回:
+        - mask: (B, N) ∈ (0,1)（或经归一化后可能>1）
+        """
+        B, N = scores.shape
+        if k <= 0:
+            return torch.zeros_like(scores)
+        if k >= N:
+            return torch.ones_like(scores)
+        # 第 k 大作为阈值（逐 batch）
+        # topk 返回前 k 个降序，取第 k 个即阈值
+        tau = torch.topk(scores, k, dim=1).values[:, -1].unsqueeze(1)  # (B,1)
+
+        # Sigmoid 软门控：分数高于阈值→接近1，低于→接近0
+        mask = torch.sigmoid((scores - tau) / max(1e-6, float(temperature)))  # (B,N)
+
+        if exact_k:
+            # 把软权重总和缩放到 k（注意可能>1；如需 [0,1] 可再 clamp）
+            sumw = mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            mask = mask * (k / sumw)
+        return mask
+
+    @staticmethod
+    def score_channels(x: torch.Tensor, mode: str = "mix", var_boost: float = 0.3) -> torch.Tensor:
+        """
+        x: (B, C, T, H, W) → scores: (B, C)
+        """
+        if mode == "l2":
+            return (x**2).sum(dim=(2,3,4))
+        elif mode == "var":
+            return x.var(dim=(2,3,4), unbiased=False)
+        else:
+            e = (x**2).sum(dim=(2,3,4))
+            v = x.var(dim=(2,3,4), unbiased=False)
+            return e + var_boost * v
+    
+    def _record_channel_selection(self, mask: torch.Tensor, scores: torch.Tensor):
+        """
+        记录每次通道选择的信息
+        mask: (B, C) - 每个通道的软/硬掩码值
+        scores: (B, C) - 每个通道的重要性分数
+        """
+        # 只在评估模式或需要分析时记录（避免训练时内存爆炸）
+        if not hasattr(self, 'enable_channel_recording') or not self.enable_channel_recording:
+            return
+        
+        B, C = mask.shape
+        
+        # 初始化累计统计（总是在CPU上）
+        if self.channel_selection_stats['selected_channels_count'] is None:
+            self.channel_selection_stats['selected_channels_count'] = torch.zeros(C, dtype=torch.float32)
+        
+        # 累计每个通道被选中的情况 (对batch求平均)
+        mask_mean = mask.mean(dim=0).detach().cpu()  # (C,) 先转到CPU
+        self.channel_selection_stats['selected_channels_count'] += mask_mean
+        self.channel_selection_stats['total_calls'] += 1
+        
+        # 记录最近的mask和scores (限制历史长度避免内存问题)
+        max_history = 100
+        if len(self.channel_selection_stats['mask_history']) < max_history:
+            self.channel_selection_stats['mask_history'].append(mask.detach().cpu())
+            self.channel_selection_stats['scores_history'].append(scores.detach().cpu())
+    
+    def load_fixed_mask(self, mask_path: str):
+        """加载固定的通道mask"""
+        import torch
+        try:
+            mask_data = torch.load(mask_path, map_location='cpu')
+            self.fixed_mask = mask_data['fixed_mask']  # (C,)
+            num_keep = mask_data.get('num_keep', int(self.fixed_mask.sum().item()))
+            print(f"[TemporalProcessor] Loaded fixed mask from {mask_path}")
+            print(f"  - Total channels: {len(self.fixed_mask)}")
+            print(f"  - Keep channels: {num_keep} ({num_keep/len(self.fixed_mask)*100:.1f}%)")
+        except Exception as e:
+            print(f"[TemporalProcessor] Failed to load fixed mask: {e}")
+            self.use_fixed_mask = False
+            self.fixed_mask = None
+    
+    def set_fixed_mask(self, mask: torch.Tensor):
+        """直接设置固定mask（用于动态切换）"""
+        self.fixed_mask = mask.cpu() if mask.is_cuda else mask
+        self.use_fixed_mask = True
+        print(f"[TemporalProcessor] Fixed mask set: keep {int(mask.sum())} / {len(mask)} channels")
+    
+    def enable_fixed_mask(self, enable: bool = True):
+        """启用或禁用固定mask模式"""
+        if enable and self.fixed_mask is None:
+            print("[TemporalProcessor] Warning: No fixed mask loaded, cannot enable fixed mask mode")
+            return
+        self.use_fixed_mask = enable
+        mode = "enabled" if enable else "disabled"
+        print(f"[TemporalProcessor] Fixed mask mode {mode}")
+    
+    def enable_channel_recording(self, enable: bool = True):
+        """启用或禁用通道选择记录"""
+        self.enable_channel_recording = enable
+        if enable:
+            print("[TemporalProcessor] Channel recording enabled")
+        else:
+            print("[TemporalProcessor] Channel recording disabled")
+    
+    def reset_channel_stats(self):
+        """重置统计信息"""
+        self.channel_selection_stats = {
+            'mask_history': [],
+            'scores_history': [],
+            'selected_channels_count': None,
+            'total_calls': 0,
+        }
+        print("[TemporalProcessor] Channel statistics reset")
+    
+    def get_channel_stats_summary(self):
+        """
+        获取通道选择统计摘要
+        返回一个字典，包含：
+        - avg_selection_freq: 每个通道平均被选中的频率 (C,)
+        - top_k_channels: 最常被选中的K个通道索引
+        - channel_names: 通道名称（根据小波子带命名）
+        """
+        if self.channel_selection_stats['selected_channels_count'] is None:
+            return {"error": "No statistics collected yet"}
+        
+        total_calls = self.channel_selection_stats['total_calls']
+        if total_calls == 0:
+            return {"error": "No calls recorded"}
+        
+        # 计算平均选择频率
+        avg_freq = self.channel_selection_stats['selected_channels_count'] / total_calls
+        
+        # 找出最常被选中的通道
+        sorted_indices = torch.argsort(avg_freq, descending=True)
+        
+        # 为通道生成名称（假设是3D Haar + 可选temporal Haar）
+        C = len(avg_freq)
+        channel_names = self._generate_channel_names(C)
+        
+        summary = {
+            'total_calls': total_calls,
+            'num_channels': C,
+            'avg_selection_frequency': avg_freq.numpy(),
+            'top_channels_indices': sorted_indices[:50].tolist(),  # 前50个
+            'top_channels_freq': avg_freq[sorted_indices[:50]].numpy(),
+            'channel_names': channel_names,
+            'top_channels_names': [channel_names[i] for i in sorted_indices[:50].tolist()],
+        }
+        
+        return summary
+    
+    def _generate_channel_names(self, total_channels: int):
+        """
+        为通道生成名称
+        基于3D Haar小波的8个子带 + 可选的temporal多层Haar
+        """
+        # 3D Haar的8个基础子带
+        base_subbands = ['LLL', 'LLH', 'LHL', 'LHH', 'HLL', 'HLH', 'HHL', 'HHH']
+        
+        if not self.multi_wavelet:
+            # 没有额外的temporal小波，直接按子带分组命名
+            # total_channels = 8 * C_latent
+            channels_per_subband = total_channels // 8
+            names = []
+            for subband in base_subbands:
+                for ch in range(channels_per_subband):
+                    names.append(f"{subband}_ch{ch}")
+            return names
+        else:
+            # 有temporal小波，需要更复杂的命名
+            # 经过L次temporal Haar后，通道数倍增
+            # 简化：直接用通道索引
+            return [f"ch_{i}" for i in range(total_channels)]
+    
+    def save_channel_stats(self, filepath: str):
+        """保存统计信息到文件"""
+        import json
+        import numpy as np
+        
+        summary = self.get_channel_stats_summary()
+        
+        # 转换numpy数组为列表以便JSON序列化
+        if 'avg_selection_frequency' in summary:
+            summary['avg_selection_frequency'] = summary['avg_selection_frequency'].tolist()
+        if 'top_channels_freq' in summary:
+            summary['top_channels_freq'] = summary['top_channels_freq'].tolist()
+        
+        with open(filepath, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"[TemporalProcessor] Channel statistics saved to {filepath}")
+    
+    def print_channel_stats(self, top_k: int = 20):
+        """打印通道选择统计信息"""
+        summary = self.get_channel_stats_summary()
+        
+        if 'error' in summary:
+            print(f"[TemporalProcessor] {summary['error']}")
+            return
+        
+        print("\n" + "="*80)
+        print(f"[TemporalProcessor] Channel Selection Statistics")
+        print("="*80)
+        print(f"Total calls: {summary['total_calls']}")
+        print(f"Total channels: {summary['num_channels']}")
+        print(f"\nTop {top_k} most selected channels:")
+        print("-"*80)
+        print(f"{'Rank':<6} {'Channel':<15} {'Index':<8} {'Avg Frequency':<15}")
+        print("-"*80)
+        
+        for rank, (idx, name, freq) in enumerate(zip(
+            summary['top_channels_indices'][:top_k],
+            summary['top_channels_names'][:top_k],
+            summary['top_channels_freq'][:top_k]
+        ), 1):
+            print(f"{rank:<6} {name:<15} {idx:<8} {freq:<15.4f}")
+        
+        print("="*80 + "\n")
+
+    def global_topk_over_coeffs(
+        self,
+        coeffs: torch.Tensor,
+        keep_ratio: float,
+        temperature: float,
+        score_mode: str,
+        var_boost: float,
+        exact_k: bool,
+        use_hard: bool,
+        is_main:bool,
+    ):
+        """
+        在整幅小波系数上（不再区分子带）做通道级 top-k。
+        支持两种模式：
+        1. 动态模式：根据每个样本的score计算top-k
+        2. 固定mask模式：所有样本使用相同的预定义mask
+        
+        coeffs: (B, Ctot, T, H, W)
+        返回: masked_coeffs (B,Ctot,T,H,W), masks_5d (B,Ctot,1,1,1), meta
+        """
+        B, Ctot, T, H, W = coeffs.shape
+        
+        # === 固定mask模式 ===
+        if self.use_fixed_mask and self.fixed_mask is not None:
+            # 使用预定义的固定mask
+            fixed_mask_1d = self.fixed_mask.to(coeffs.device)  # (Ctot,)
+            
+            # 扩展到batch维度：(B, Ctot)
+            mask = fixed_mask_1d.unsqueeze(0).expand(B, -1)
+            
+            # 扩展到5D：(B, Ctot, 1, 1, 1)
+            mask5 = mask.view(B, Ctot, 1, 1, 1)
+            
+            # 应用mask
+            masked = coeffs * mask5
+            
+            # 元数据
+            K_total = int(fixed_mask_1d.sum().item())
+            
+            meta = {
+                "K_total_target": K_total,
+                "mask_sum_mean": K_total,  # 固定mask下每个样本都一样
+                "mode": "fixed_mask",
+            }
+            if is_main:
+                print(
+                    f"[TemporalProcessor] global_topk_over_coeffs use_hard={use_hard} K_target={meta.get('K_total_target')} "
+                    f"mask_sum_mean={meta.get('mask_sum_mean'):.2f} use_fixed_mask={self.use_fixed_mask}"
+                )
+            
+            return masked, mask5, meta
+        else:
+            #raise ValueError("No fixed mask provided, Currently we only try fixed mask mode")
+            print(f"[TemporalProcessor] no fixed mask provided, using dynamic top-k")
+        
+            #=== 动态top-k模式（原逻辑）不再做动态
+            K_total = int(max(0, min(Ctot, round(Ctot * keep_ratio))))
+            scores = self.score_channels(coeffs, mode=score_mode, var_boost=var_boost)  # (B,Ctot)
+            if use_hard:
+                mask = self.hard_topk_mask(scores, K_total)
+            else:
+                mask = self.soft_topk_mask(scores, K_total, temperature=temperature, exact_k=exact_k)
+            mask5 = mask.view(B, Ctot, 1, 1, 1)
+            masked = coeffs * mask5
+        
+        # 记录通道选择统计信息
+        self._record_channel_selection(mask, scores)
+        
+        meta = {
+            "K_total_target": K_total,
+            "mask_sum_mean": mask.sum(dim=1).mean().item(),
+            "mode": "dynamic_topk",
+        }
+        return masked, mask5, meta
+
+
+    def compress_forward(self, z: torch.Tensor):
+
+        # 3D Haar小波变换（可选多次变换）
+        try:
+            is_main = os.environ.get("LOCAL_RANK", "0") == "0"
+        except Exception:
+            is_main = True
+
+        if is_main:
+            print(f"[TemporalProcessor] entering {self.training_phase}, training={self.training}, z={tuple(z.shape)}")
+
+
+
+
+        coeffs = self.dwt3d(z)  # (B, Ctot, T/2, H/2, W/2)
+        if self.multi_wavelet:
+            for _ in range(getattr(self, "temporal_wavelet_levels", 2)):
+                coeffs = self.dwt_temporal(coeffs)
+
+
+
+        B, full_C, T_w, H_w, W_w = coeffs.shape
+        if self.training_phase == "phase1" or self.training_phase == "phase2":
+            use_hard = (not self.training)
+            if not self.not_compress:
+                masked_coeffs, masks_5d, meta = self.global_topk_over_coeffs(
+                    coeffs,
+                    keep_ratio=self.keep_ratio,
+                    temperature=self.temperature,
+                    score_mode=self.score_mode,
+                    var_boost=self.var_boost,
+                    exact_k=self.exact_k,
+                    use_hard=use_hard,
+                    is_main=is_main
+                )
+            else:
+                masked_coeffs = coeffs
+                masks_5d = None
+                meta = None
+
+
+            if self.training_phase == "phase2":
+                if is_main:
+                    print(f"[TemporalProcessor] phase2 consistency_mode={self.temporal_consistency_mode}")
+                lowfreq_consistency_loss = self.lowfreq_consistency_loss(
+                    coeffs, mode=self.temporal_consistency_mode
+                )
+                return masked_coeffs, masks_5d, meta , lowfreq_consistency_loss
+            else:
+                return masked_coeffs, masks_5d, meta , None            
+        else:
+            raise ValueError(f"Unknown training_phase: {self.training_phase}")
+    
+    def decompress_backward(
+        self, 
+        coeffs: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        三阶段反向解压：
+        - Phase 1/2: 完整coeffs -> 逆3D Haar -> latent
+        - Phase 3: 稀疏coeff_sparse -> 拼接 -> 逆3D Haar -> latent
+        
+        Args:
+            coeffs: (B, 8*C, T, H, W) 完整的小波系数 (Phase 1/2)
+            
+        Returns:
+            z: (B, C, 2*T, 2*H, 2*W) 重构的latent
+        """
+        if self.training_phase in ["phase1", "phase2"]:
+            if self.multi_wavelet and coeffs is not None:
+                for _ in range(getattr(self, "temporal_wavelet_levels", 2)):
+                    coeffs = self.idwt_temporal(coeffs)
+            z = self.idwt3d(coeffs)
+        elif self.training_phase == "phase3":
+
+            if coeffs is None:
+                raise ValueError("coeffs must be provided for phase3 decompress when using global top-k.")
+            if self.multi_wavelet:
+                for _ in range(getattr(self, "temporal_wavelet_levels", 2)):
+                    coeffs = self.idwt_temporal(coeffs)
+            z = self.idwt3d(coeffs)
+        else:
+            raise ValueError(f"Unknown training_phase: {self.training_phase}")
+        return z
+
+        
+@ModelRegistry.register("WFVAE")
+class WFVAEModel(VideoBaseAE):
+
+    @register_to_config
+    def __init__(
+        self,
+        latent_dim: int = 8,
+        base_channels: int = 128,
+        encoder_num_resblocks: int = 2,
+        encoder_energy_flow_hidden_size: int = 64,
+        decoder_num_resblocks: int = 2,
+        decoder_energy_flow_hidden_size: int = 128,
+        attention_type: str = "AttnBlock3DFix",
+        use_attention: bool = True,
+        dropout: float = 0.0,
+        norm_type: str = "groupnorm",
+        t_interpolation: str = "nearest",
+        connect_res_layer_num: int = 1,
+        scale: List[float] = [0.18215, 0.18215, 0.18215, 0.18215],
+        shift: List[float] = [0, 0, 0, 0],
+        # Module config
+        l1_dowmsample_block: str = "Downsample",
+        l1_downsample_wavelet: str = "HaarWaveletTransform2D",
+        l2_dowmsample_block: str = "Spatial2xTime2x3DDownsample",
+        l2_downsample_wavelet: str = "HaarWaveletTransform3D",
+        l1_upsample_block: str = "Upsample",
+        l1_upsample_wavelet: str = "InverseHaarWaveletTransform2D",
+        l2_upsample_block: str = "Spatial2xTime2x3DUpsample",
+        l2_upsample_wavelet: str = "InverseHaarWaveletTransform3D",
+    ) -> None:
+        super().__init__()
+        self.use_tiling = False
+        self.use_quant_layer = False
+
+        # It will auto set when tiling is enabled.
+        self.t_chunk_enc = None
+        self.t_chunk_dec = None
+        self.temporal_size = None
+
+        self.encoder = Encoder(
+            latent_dim=latent_dim,
+            base_channels=base_channels,
+            num_resblocks=encoder_num_resblocks,
+            energy_flow_hidden_size=encoder_energy_flow_hidden_size,
+            dropout=dropout,
+            use_attention=use_attention,
+            norm_type=norm_type,
+            l1_dowmsample_block=l1_dowmsample_block,
+            l1_downsample_wavelet=l1_downsample_wavelet,
+            l2_dowmsample_block=l2_dowmsample_block,
+            l2_downsample_wavelet=l2_downsample_wavelet,
+            attention_type=attention_type,
+        )
+        self.decoder = Decoder(
+            latent_dim=latent_dim,
+            base_channels=base_channels,
+            num_resblocks=decoder_num_resblocks,
+            energy_flow_hidden_size=decoder_energy_flow_hidden_size,
+            dropout=dropout,
+            use_attention=use_attention,
+            norm_type=norm_type,
+            t_interpolation=t_interpolation,
+            connect_res_layer_num=connect_res_layer_num,
+            l1_upsample_block=l1_upsample_block,
+            l1_upsample_wavelet=l1_upsample_wavelet,
+            l2_upsample_block=l2_upsample_block,
+            l2_upsample_wavelet=l2_upsample_wavelet,
+            attention_type=attention_type,
+        )
+
+        # Set cache offset for trilinear lossless upsample.
+        # Now only support 4 or 8 temporal compression rate.
+        if l1_dowmsample_block == "Downsample":
+            self.temporal_uptimes = 4
+            self._set_cache_offset(
+                [
+                    self.decoder.up2,
+                    self.decoder.connect_l2,
+                    self.decoder.conv_in,
+                    self.decoder.mid,
+                ],
+                1,
+            )
+            self._set_cache_offset(
+                [
+                    self.decoder.up2[-2:],
+                    self.decoder.up1,
+                    self.decoder.connect_l1,
+                    self.decoder.layer,
+                ],
+                2,
+            )
+        else:
+            self.temporal_uptimes = 8
+            self._set_cache_offset(
+                [
+                    self.decoder.up2,
+                    self.decoder.connect_l2,
+                    self.decoder.conv_in,
+                    self.decoder.mid,
+                ],
+                1,
+            )
+            self._set_cache_offset(
+                [self.decoder.up2[-2:], self.decoder.connect_l1, self.decoder.up1], 2
+            )
+            self._set_cache_offset([self.decoder.up1[-2:], self.decoder.layer], 4)
+
+    def get_encoder(self):
+        if self.use_quant_layer:
+            return [self.quant_conv, self.encoder]
+        return [self.encoder]
+
+    def get_decoder(self):
+        if self.use_quant_layer:
+            return [self.post_quant_conv, self.decoder]
+        return [self.decoder]
+
+    def _empty_causal_cached(self, parent):
+        for name, module in parent.named_modules():
+            if hasattr(module, "causal_cached"):
+                module.causal_cached = deque()
+
+    def _set_causal_cached(self, enable_cached=True):
+        for name, module in self.named_modules():
+            if hasattr(module, "enable_cached"):
+                module.enable_cached = enable_cached
+
+    def _set_cache_offset(self, modules, cache_offset=0):
+        for module in modules:
+            for submodule in module.modules():
+                if hasattr(submodule, "cache_offset"):
+                    submodule.cache_offset = cache_offset
+
+    def _set_first_chunk(self, is_first_chunk=True):
+        for module in self.modules():
+            if hasattr(module, "is_first_chunk"):
+                module.is_first_chunk = is_first_chunk
+
+    def build_chunk_start_end(self, t, decoder_mode=False):
+        start_end = [[0, 1]]
+        start = 1
+        end = start
+        while True:
+            if start >= t:
+                break
+            end = min(t, end + (self.t_chunk_dec if decoder_mode else self.t_chunk_enc))
+            start_end.append([start, end])
+            start = end
+        return start_end
+
+    def encode(self, x):
+        self._empty_causal_cached(self.encoder)
+        self._set_first_chunk(True)
+
+        if self.use_tiling:
+            h = self.tile_encode(x)
+            l1, l2 = None, None
+        else:
+            h, (l1, l2) = self.encoder(x)
+            if self.use_quant_layer:
+                h = self.quant_conv(h)
+
+        posterior = DiagonalGaussianDistribution(h)
+        return AutoencoderKLOutput(latent_dist=posterior, extra_output=(l1, l2))
+
+    def _auto_select_t_chunk(self):
+        assert self.temporal_uptimes in [
+            4,
+            8,
+        ], "Only support 4 or 8 temporal compression rate."
+        t_compess_rate = self.temporal_uptimes  # Compression rate.
+        downsample_times = int(math.log(t_compess_rate, 2))
+        temporal_size = self.temporal_size  # Video length.
+        dec_t_chunk = 2
+        enc_t_chunk = t_compess_rate
+
+        # If chunk too large, disable tiling inference.
+        success_auto_select = False
+        while dec_t_chunk < temporal_size and enc_t_chunk < temporal_size:
+            T_list = [temporal_size]
+            for i in range(downsample_times):
+                T_list.append((T_list[-1] - 1) // 2 + 1)
+
+            # Judge if decoder chunk is valid.
+            if (T_list[-1] - 1) % dec_t_chunk == 1:
+                dec_t_chunk *= 2
+                continue
+
+            # Judge if encoder chunk is valid.
+            for inner_T in T_list[:-1]:
+                if (inner_T - 1) % 2 != 0:
+                    enc_t_chunk *= 2
+                    continue
+
+                if (inner_T - 1) % enc_t_chunk == 1 and (inner_T - 1) / enc_t_chunk > 1:
+                    enc_t_chunk *= 2
+                    continue
+
+            success_auto_select = True
+            break
+
+        if not success_auto_select:
+            raise ValueError(
+                "Can't find valid chunk size. Please check your input video length or disable tiling."
+            )
+        self.t_chunk_enc = enc_t_chunk
+        self.t_chunk_dec = dec_t_chunk
+        print(f"Auto selected chunk size: {enc_t_chunk} for encoder and {dec_t_chunk} for decoder.")
+
+    def tile_encode(self, x):
+        b, c, t, h, w = x.shape
+
+        if self.temporal_size is None:
+            self.temporal_size = t
+            self._auto_select_t_chunk()
+            
+        if self.temporal_size and self.temporal_size != t:
+            raise ValueError(
+                "Input temporal size is not consistent with the temporal size of the model."
+            )
+        
+        start_end = self.build_chunk_start_end(t)
+        result = []
+        for idx, (start, end) in enumerate(start_end):
+            self._set_first_chunk(idx == 0)
+            chunk = x[:, :, start:end, :, :]
+            chunk = self.encoder(chunk)[0]
+            if self.use_quant_layer:
+                chunk = self.quant_conv(chunk)
+            result.append(chunk)
+
+        return torch.cat(result, dim=2)
+
+    def decode(self, z):
+        self._empty_causal_cached(self.decoder)
+        self._set_first_chunk(True)
+        
+        if self.use_tiling:
+            dec = self.tile_decode(z)
+            l1, l2 = None, None
+        else:
+            if self.use_quant_layer:
+                z = self.post_quant_conv(z)
+            dec, (l1, l2) = self.decoder(z)
+
+        return DecoderOutput(sample=dec, extra_output=(l1, l2))
+
+    def tile_decode(self, x):
+        b, c, t_latent, h, w = x.shape
+        
+        t_upsampled = (t_latent - 1) * self.temporal_uptimes + 1
+        if self.temporal_size is None:
+            self.temporal_size = t_upsampled
+            # self.t_chunk_dec = 4
+            self._auto_select_t_chunk()
+        
+        if self.temporal_size and self.temporal_size != t_upsampled:
+            raise ValueError(
+                "Input temporal size is not consistent with the temporal size of the model."
+            )
+        
+        start_end = self.build_chunk_start_end(t_latent, decoder_mode=True)
+        
+        result = []
+        for idx, (start, end) in enumerate(start_end):
+            self._set_first_chunk(idx == 0)
+
+            if idx != 0 and end + 1 < t_latent:
+                chunk: Any = x[:, :, start : end + 1, :, :]
+            else:
+                chunk = x[:, :, start:end, :, :]
+
+            if self.use_quant_layer:
+                chunk = self.post_quant_conv(chunk)
+            chunk = self.decoder(chunk)[0]
+            if idx != 0 and end + 1 < t_latent:
+                chunk = chunk[:, :, : -self.temporal_uptimes]
+                result.append(chunk.clone())
+            else:
+                result.append(chunk.clone())
+
+        for chunk in result:
+            print(chunk.shape)
+            
+        return torch.cat(result, dim=2)
+
+    def forward(self, input, sample_posterior=True):
+        encode_output = self.encode(input)
+        posterior, (enc_l1, enc_l2) = (
+            encode_output.latent_dist,
+            encode_output.extra_output,
+        )
+
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+
+        decode_output = self.decode(z)
+        dec, (dec_l1, dec_l2) = decode_output.sample, decode_output.extra_output
+        return ForwardOutput(
+            sample=dec,
+            latent_dist=posterior,
+            extra_output=(enc_l1, dec_l1, enc_l2, dec_l2),
+        )
+
+    def get_last_layer(self):
+        if hasattr(self.decoder.conv_out, "conv"):
+            return self.decoder.conv_out.conv.weight
+        else:
+            return self.decoder.conv_out.weight
+
+    def enable_tiling(self, use_tiling: bool = True):
+        self.use_tiling = use_tiling
+        self._set_causal_cached(use_tiling)
+
+    def disable_tiling(self):
+        self.enable_tiling(False)
+
+    def init_from_ckpt(self, path, ignore_keys=list()):
+        sd = torch.load(path, map_location="cpu")
+        print("init from " + path)
+
+        if (
+            "ema_state_dict" in sd
+            and len(sd["ema_state_dict"]) > 0
+            and os.environ.get("NOT_USE_EMA_MODEL", 0) == 0
+        ):
+            print("Load from ema model!")
+            sd = sd["ema_state_dict"]
+            sd = {key.replace("module.", ""): value for key, value in sd.items()}
+        elif "state_dict" in sd:
+            print("Load from normal model!")
+            if "gen_model" in sd["state_dict"]:
+                sd = sd["state_dict"]["gen_model"]
+            else:
+                sd = sd["state_dict"]
+
+        keys = list(sd.keys())
+
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+
+        missing_keys, unexpected_keys = self.load_state_dict(sd, strict=False)

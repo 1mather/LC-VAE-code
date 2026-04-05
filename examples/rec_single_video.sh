@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=5 python scripts/recon_single_video.py \
+    --model_name WFVAE \
+    --from_pretrained "/mnt/data/lzj/codes/WF-VAE/vae888" \
+    --video_path /mnt/data/multi-face/data/sucai/istock/videos_istock_coco_part7/gm1211844241-351588364.mp4 \
+    --rec_path rec_tile.mp4 \
+    --device cuda \
+    --sample_rate 1 \
+    --num_frames 57 \
+    --height 512 \
+    --width 512 \
+    --fps 30 \
+    --enable_tiling

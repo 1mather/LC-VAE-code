@@ -1,0 +1,12 @@
+{
+  "_class_name": "Wan2_1_VAE_Trainable",
+  "z_channels": 16,
+  "dim": 96,
+  "dim_mult": [1, 2, 4, 4],
+  "num_res_blocks": 2,
+  "attn_scales": [],
+  "temporal_downsample": [false, true, true],
+  "dropout": 0.0,
+  "use_latent_normalization": false
+}
+

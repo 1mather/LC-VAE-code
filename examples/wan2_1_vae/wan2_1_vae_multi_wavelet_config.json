@@ -1,0 +1,17 @@
+{
+  "_class_name": "Wan2_1_VAE_MultiWavelet",
+  "z_channels": 32,
+  "dim": 96,
+  "dim_mult": [1, 2, 4, 4],
+  "num_res_blocks": 2,
+  "attn_scales": [],
+  "temporal_downsample": [false, true, true],
+  "dropout": 0.0,
+  "use_latent_normalization": false,
+  "keep_ratio": 0.5,
+  "global_topk": true,
+  "use_fixed_mask": true,
+  "fixed_mask_path": "/scratch/cs/vidgen/guanjr/project/latent_wf_vae_new/causalvideovae/model/channel_name/3D_t_t/keep_ratio_0.5_32_channel_50%/channel_masks/fixed_mask_from_handcraft.pth",
+  "not_compress": false
+}
+
